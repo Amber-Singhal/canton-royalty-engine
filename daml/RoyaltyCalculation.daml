@@ -1,0 +1,175 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RoyaltyCalculation where
+
+import Daml.Script
+
+import DA.Assert
+import DA.List (sum, map, length)
+import DA.Next.Set (fromList, toList)
+
+import RightsHolder (RightsHolder(..))
+import UsageReport (UsageReport(..))
+
+-- Data type to represent a single line in the royalty distribution.
+data DistributionLineItem = DistributionLineItem
+  with
+    holder : Party
+    amount : Decimal
+  deriving (Eq, Show)
+
+-- Represents the agreed-upon calculation for a specific usage report.
+-- This contract is the outcome of a calculation and serves as an auditable record
+-- before payments are disbursed. The licensee's signature confirms their
+-- agreement with the calculated amounts they are due to pay.
+template RoyaltyCalculation
+  with
+    operator        : Party               -- The party running the royalty service.
+    licensee        : Party               -- The party who reported usage and owes the royalties.
+    assetId         : Text                -- The unique identifier for the digital content.
+    usageReportCid  : ContractId UsageReport -- The source usage report for this calculation.
+    distribution    : [DistributionLineItem] -- The calculated royalty amount for each rights holder.
+    totalAmount     : Decimal             -- The total royalty amount from the usage report.
+  where
+    signatory operator, licensee
+    observer map (.holder) distribution
+
+    let allHolders = map (.holder) distribution
+        calculatedTotal = DA.List.sum $ map (.amount) distribution
+
+    ensure
+      totalAmount > 0.0 &&
+      -- Ensure no duplicate holders in the distribution list.
+      length (toList $ fromList allHolders) == length allHolders &&
+      -- Ensure the sum of distributed amounts equals the total amount from the report.
+      -- This is a critical integrity check.
+      calculatedTotal == totalAmount
+
+    key (operator, licensee, usageReportCid) : (Party, Party, ContractId UsageReport)
+    maintainer key._1
+
+-- A long-lived agreement that enables a licensee to report usage for a
+-- specific asset and have the operator process royalty calculations.
+template RoyaltyAgreement
+  with
+    operator : Party
+    licensee : Party
+    assetId  : Text
+  where
+    signatory operator, licensee
+
+    key (operator, licensee, assetId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- The core choice to process a usage report and generate a royalty calculation.
+    -- This is an atomic transaction that fetches all inputs, validates them,
+    -- calculates the distribution, and creates the `RoyaltyCalculation` contract.
+    choice ProcessUsageReport : ContractId RoyaltyCalculation
+      with
+        reportCid       : ContractId UsageReport
+        rightsHolderCids : [ContractId RightsHolder]
+      controller operator
+      do
+        -- Fetch contracts to access their data.
+        report <- fetch reportCid
+        rightsHolders <- mapA fetch rightsHolderCids
+
+        -- Validations
+        assertMsg "Usage report must be for the asset governed by this agreement"
+          (report.assetId == this.assetId)
+        assertMsg "Usage report must be from the licensee party to this agreement"
+          (report.licensee == this.licensee)
+        assertMsg "There must be at least one rights holder"
+          (not $ null rightsHolders)
+
+        -- Verify that the sum of all shares is exactly 100%.
+        let totalShares = DA.List.sum $ map (.share) rightsHolders
+        assertMsg "Sum of rights holder shares must equal 1.0 (100%)"
+          (totalShares == 1.0)
+
+        -- Ensure all rights holders are unique parties.
+        let allHolderParties = map (.holder) rightsHolders
+        assertMsg "All rights holders must be unique"
+          (length (toList $ fromList allHolderParties) == length allHolderParties)
+
+        -- Perform the calculation for each rights holder.
+        let distribution = map
+              (\rh -> DistributionLineItem with
+                        holder = rh.holder
+                        amount = report.totalRoyaltyAmount * rh.share
+              )
+              rightsHolders
+
+        -- Archive the usage report to prevent it from being processed again.
+        archive reportCid
+
+        -- Create the final, auditable calculation contract.
+        create RoyaltyCalculation with
+          operator = this.operator
+          licensee = this.licensee
+          assetId = this.assetId
+          usageReportCid = reportCid
+          distribution = distribution
+          totalAmount = report.totalRoyaltyAmount
+
+-- Test script to demonstrate the workflow.
+test_royalty_calculation : Script ()
+test_royalty_calculation = script do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  licensee <- allocatePartyWithHint "Licensee" (PartyIdHint "licensee")
+  creator <- allocatePartyWithHint "Creator" (PartyIdHint "creator")
+  publisher <- allocatePartyWithHint "Publisher" (PartyIdHint "publisher")
+  investor <- allocatePartyWithHint "Investor" (PartyIdHint "investor")
+
+  let
+    assetId = "SONG-001"
+    reportId = "Q1-2024-REPORT"
+    totalRoyalty = 1000.0
+
+  -- 1. Setup rights holders with their respective shares.
+  creatorCid <- submit creator do
+    create RightsHolder with holder = creator, assetId = assetId, share = 0.50 -- 50%
+  publisherCid <- submit publisher do
+    create RightsHolder with holder = publisher, assetId = assetId, share = 0.30 -- 30%
+  investorCid <- submit investor do
+    create RightsHolder with holder = investor, assetId = assetId, share = 0.20 -- 20%
+
+  let rightsHolderCids = [creatorCid, publisherCid, investorCid]
+
+  -- 2. Licensee submits a usage report.
+  usageReportCid <- submit licensee do
+    create UsageReport with
+      licensee = licensee
+      operator = operator
+      assetId = assetId
+      reportId = reportId
+      totalRoyaltyAmount = totalRoyalty
+
+  -- 3. Operator and Licensee establish an agreement.
+  agreementCid <- submitMulti [operator, licensee] [] do
+    create RoyaltyAgreement with operator, licensee, assetId
+
+  -- 4. Operator processes the report using the agreement.
+  calculationCid <- submit operator do
+    exercise agreementCid ProcessUsageReport with reportCid = usageReportCid, rightsHolderCids
+
+  -- 5. Verify the results.
+  calculation <- fetch calculationCid
+  debug $ "Royalty Calculation created: " <> show calculation
+
+  let expectedDistribution =
+        [ DistributionLineItem with holder = creator, amount = 500.0
+        , DistributionLineItem with holder = publisher, amount = 300.0
+        , DistributionLineItem with holder = investor, amount = 200.0
+        ]
+
+  -- Assert that the calculated distribution matches the expected outcome.
+  calculation.distribution === expectedDistribution
+  calculation.totalAmount === totalRoyalty
+
+  -- Verify the usage report was archived, proving it was processed.
+  submitMustFail licensee do
+    fetch usageReportCid
+
+  pure ()

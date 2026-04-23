@@ -1,0 +1,63 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RoyaltyEngine.UsageReport where
+
+import DA.Date (Date)
+
+-- | Represents a usage report submitted by a licensee for a specific piece of content.
+-- This contract is the starting point for a royalty calculation and distribution cycle.
+-- It contains the necessary data for a licensor to determine the total royalty amount
+-- due for a given reporting period.
+template UsageReport
+  with
+    licensee: Party
+      -- ^ The party licensed to use the content and responsible for reporting.
+    licensor: Party
+      -- ^ The content owner or master rights holder who receives the report.
+    contentId: Text
+      -- ^ A unique identifier for the content being reported on (e.g., ISRC, ISWC, ISBN).
+    reportId: Text
+      -- ^ A unique identifier for this specific usage report to prevent duplicates.
+    unitsConsumed: Int
+      -- ^ The number of units consumed during the period (e.g., streams, downloads, sales).
+    grossRevenue: Decimal
+      -- ^ The total gross revenue generated from the consumption of the content.
+    royaltyRate: Decimal
+      -- ^ The contractual royalty rate to be applied to the gross revenue (e.g., 0.15 for 15%).
+    reportingPeriodStart: Date
+      -- ^ The start date of the reporting period (inclusive).
+    reportingPeriodEnd: Date
+      -- ^ The end date of the reporting period (inclusive).
+  where
+    signatory licensee
+    observer licensor
+
+    key (licensee, contentId, reportId) : (Party, Text, Text)
+    maintainer key._1
+
+    ensure reportingPeriodStart <= reportingPeriodEnd &&
+           royaltyRate >= 0.0 && royaltyRate <= 1.0 &&
+           grossRevenue >= 0.0 &&
+           unitsConsumed >= 0
+
+    -- | Helper function to calculate the total royalty amount due from this report.
+    -- This is the amount that will be distributed among the registered rights holders.
+    let totalRoyaltyAmount: Decimal = grossRevenue * royaltyRate
+
+    -- | Allows the licensor to acknowledge and process the usage report.
+    -- In a full implementation, exercising this choice would trigger the creation
+    -- of `RoyaltyCalculation` or `PaymentInstruction` contracts based on the
+    -- `totalRoyaltyAmount`. For this model, it simply archives the report,
+    -- marking it as processed.
+    nonconsuming choice GetTotalRoyaltyAmount: Decimal
+      controller licensor, licensee
+      do
+        return totalRoyaltyAmount
+
+    -- | Archives the report after it has been processed by the licensor, signifying
+    -- that the data has been ingested into the next stage of the royalty workflow.
+    choice ArchiveReport: ()
+      controller licensor
+      do
+        pure ()

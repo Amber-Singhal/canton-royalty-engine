@@ -1,0 +1,138 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Royalty.RightsHolder where
+
+import Daml.Script
+
+-- | Represents a single rights holder's percentage share in a creative work.
+-- This contract is created and managed by a royalty distributor.
+template Share
+  with
+    distributor     : Party
+      -- ^ The party responsible for royalty management and distribution.
+    contentId       : Text
+      -- ^ A unique identifier for the creative work (e.g., ISRC, ISWC, or internal ID).
+    holder          : Party
+      -- ^ The party that holds the rights and is entitled to royalties.
+    sharePercentage : Decimal
+      -- ^ The percentage of royalties this holder is entitled to. Must be > 0.0 and <= 100.0.
+  where
+    signatory distributor
+    observer holder
+
+    ensure
+      sharePercentage > 0.0 && sharePercentage <= 100.0
+
+    key (distributor, contentId, holder) : (Party, Text, Party)
+    maintainer key._1
+
+    nonconsuming choice UpdateSharePercentage : ContractId Share
+      -- ^ The distributor can update the holder's share percentage.
+      with
+        newSharePercentage : Decimal
+          -- ^ The new percentage share.
+      controller distributor
+      do
+        ensure newSharePercentage > 0.0 && newSharePercentage <= 100.0
+        create this with sharePercentage = newSharePercentage
+
+    choice ProposeTransfer : ContractId ShareTransferProposal
+      -- ^ The current rights holder can propose to transfer their share to another party.
+      with
+        newHolder : Party
+          -- ^ The party to whom the rights share will be transferred.
+      controller holder
+      do
+        assertMsg "Cannot transfer rights to the same holder" $ newHolder /= holder
+        create ShareTransferProposal with
+          shareCid = self
+          distributor
+          currentHolder = holder
+          newHolder
+
+-- | A proposal to transfer a rights share from one holder to another. This
+-- must be accepted by the distributor to become effective.
+template ShareTransferProposal
+  with
+    shareCid      : ContractId Share
+      -- ^ The original `Share` contract being transferred.
+    distributor   : Party
+      -- ^ The royalty distributor, who must approve the transfer.
+    currentHolder : Party
+      -- ^ The party initiating the transfer.
+    newHolder     : Party
+      -- ^ The proposed new rights holder.
+  where
+    signatory currentHolder
+    observer distributor
+
+    choice AcceptTransfer : ContractId Share
+      -- ^ The distributor accepts the transfer, creating a new `Share` for the
+      -- new holder and archiving the old one.
+      controller distributor
+      do
+        originalShare <- fetch shareCid
+        -- Ensure the proposal is still valid for the fetched contract
+        assertMsg "Mismatched distributor" $ originalShare.distributor == distributor
+        assertMsg "Mismatched holder" $ originalShare.holder == currentHolder
+
+        -- Archive the original share and create the new one
+        archive shareCid
+        create originalShare with holder = newHolder
+
+    choice RejectTransfer : ()
+      -- ^ The distributor rejects the transfer proposal.
+      controller distributor
+      do pure ()
+
+    choice WithdrawTransfer : ()
+      -- ^ The current holder withdraws their transfer proposal.
+      controller currentHolder
+      do pure ()
+
+
+-- | Daml Script for setting up initial rights holders for a piece of content.
+setup : Script ()
+setup = script do
+  distributor <- allocatePartyWithHint "RoyaltyDistributor" (PartyIdHint "royalty-distributor")
+  artist <- allocatePartyWithHint "Artist" (PartyIdHint "artist")
+  producer <- allocatePartyWithHint "Producer" (PartyIdHint "producer")
+  label <- allocatePartyWithHint "RecordLabel" (PartyIdHint "record-label")
+
+  let contentId = "ISRC-US-S1Z-24-00001"
+
+  artistShareCid <- submit distributor do
+    createCmd Share with
+      distributor
+      contentId
+      holder = artist
+      sharePercentage = 50.0
+
+  producerShareCid <- submit distributor do
+    createCmd Share with
+      distributor
+      contentId
+      holder = producer
+      sharePercentage = 30.0
+
+  labelShareCid <- submit distributor do
+    createCmd Share with
+      distributor
+      contentId
+      holder = label
+      sharePercentage = 20.0
+
+  -- Example of an update
+  updatedArtistShareCid <- submit distributor do
+    exerciseCmd artistShareCid UpdateSharePercentage with newSharePercentage = 45.0
+
+  -- Example of a transfer proposal and acceptance
+  newArtist <- allocatePartyWithHint "NewArtist" (PartyIdHint "new-artist")
+  proposalCid <- submit artist do
+    exerciseCmd updatedArtistShareCid ProposeTransfer with newHolder = newArtist
+
+  _ <- submit distributor do
+    exerciseCmd proposalCid AcceptTransfer
+
+  pure ()

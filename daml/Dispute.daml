@@ -1,0 +1,100 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DigitalContent.Dispute where
+
+import Daml.Script
+
+import DA.Date (Date)
+import DA.Time (time, toDateUTC)
+import DA.Assert (assertMsg)
+import DA.Map as Map (keys, member)
+
+import DigitalContent.Rights (RightsAllocation)
+
+-- | Proposal for a rights holder to file a dispute against a RightsAllocation.
+-- This must be accepted by the content owner to become an active Dispute contract.
+template DisputeProposal
+  with
+    disputer: Party
+      -- ^ The rights holder proposing the dispute.
+    contentOwner: Party
+      -- ^ The owner of the content and creator of the allocation.
+    allocationCid: ContractId RightsAllocation
+      -- ^ The specific RightsAllocation contract being disputed.
+    reason: Text
+      -- ^ A detailed reason for the dispute.
+  where
+    signatory disputer
+    observer contentOwner
+
+    key (allocationCid, disputer) : (ContractId RightsAllocation, Party)
+    maintainer key._2
+
+    -- | The content owner accepts the dispute proposal, creating a formal Dispute contract.
+    choice AcceptDispute : ContractId Dispute
+      controller contentOwner
+      do
+        -- Fetch the allocation to validate the parties and get the full list of holders.
+        allocation <- fetch allocationCid
+        assertMsg "Proposal content owner must match allocation content owner"
+          (self.contentOwner == allocation.contentOwner)
+        assertMsg "Disputer must be a rights holder in the allocation"
+          (Map.member self.disputer allocation.rightsHolders)
+
+        now <- getTime
+        create Dispute with
+          disputer = self.disputer
+          contentOwner = self.contentOwner
+          allocationCid = self.allocationCid
+          reason = self.reason
+          disputeDate = toDateUTC now
+          allRightsHolders = Map.keys allocation.rightsHolders
+
+    -- | The disputer can withdraw their proposal before it is accepted.
+    choice WithdrawProposal : ()
+      controller disputer
+      do
+        return ()
+
+-- | Represents a formal dispute filed by a rights holder against a RightsAllocation.
+-- While a Dispute is active, the associated RightsAllocation should be considered
+-- frozen for payment distribution purposes. The logic for this freeze is implemented
+-- in the royalty distribution process, which must check for the existence of an
+-- active dispute for a given allocation before proceeding.
+template Dispute
+  with
+    disputer: Party
+      -- ^ The rights holder who raised the dispute.
+    contentOwner: Party
+      -- ^ The owner of the content and creator of the allocation.
+    allocationCid: ContractId RightsAllocation
+      -- ^ The specific RightsAllocation contract being disputed.
+    reason: Text
+      -- ^ The reason for the dispute.
+    disputeDate: Date
+      -- ^ The date the dispute was formally filed (i.e., when the proposal was accepted).
+    allRightsHolders : [Party]
+      -- ^ All rights holders from the original allocation, kept as observers for transparency.
+  where
+    signatory disputer, contentOwner
+    observer allRightsHolders
+
+    key (allocationCid, disputer) : (ContractId RightsAllocation, Party)
+    maintainer key._2
+
+    -- | Allows the content owner to resolve the dispute, which archives this contract.
+    -- Resolution implies that the content owner will take corrective action, such as
+    -- archiving the disputed allocation and issuing a new, corrected one. This action
+    -- happens in a separate transaction.
+    choice ResolveDispute: ()
+      controller contentOwner
+      do
+        return ()
+
+    -- | Allows the disputer to withdraw their dispute, archiving this contract.
+    -- This unblocks the associated RightsAllocation for royalty distributions.
+    choice WithdrawDispute: ()
+      controller disputer
+      do
+        return ()

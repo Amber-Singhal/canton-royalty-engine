@@ -1,0 +1,218 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RoyaltyTest where
+
+import Daml.Script
+
+import DA.Assert
+import DA.List (sortOn)
+import DA.Text (toText, isInfixOf)
+
+import RightsHolder
+import UsageReport
+import RoyaltyCalculation
+import PaymentSplit
+
+-- | The main test suite for the royalty engine.
+royaltyTestSuite = script do
+  -- Allocate parties for various roles in the scenarios
+  operator <- allocateParty "Operator"
+  licensee <- allocateParty "Licensee"
+  creator <- allocateParty "Creator"
+  producer <- allocateParty "Producer"
+  publisher <- allocateParty "Publisher"
+
+  -- Create a single instance of the royalty engine to be used across tests
+  engineCid <- submit operator do
+    createCmd RoyaltyEngine with operator
+
+  -- Run individual test cases
+  test_SingleHolder operator licensee creator engineCid
+  test_MultiHolder operator licensee creator producer publisher engineCid
+  test_ZeroRevenue operator licensee creator engineCid
+  test_ComplexDistribution operator licensee creator producer publisher engineCid
+  test_NoHoldersFailure operator licensee engineCid
+  test_InvalidSharesFailure operator licensee creator producer engineCid
+  test_MismatchedContentIdFailure operator licensee creator producer engineCid
+
+-- | Test scenario: 100% royalty allocation to a single rights holder.
+test_SingleHolder operator licensee creator engineCid = script do
+  debug "Running test_SingleHolder..."
+  let contentId = "SONG-001"
+
+  -- Setup: Creator is the sole rights holder
+  creatorHolderCid <- submit creator do
+    createCmd RightsHolder with
+      operator, contentId, holder = creator, share = 1.0
+
+  -- Action: Licensee reports usage
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with
+      operator, licensee, contentId, revenue = 1000.0, royaltyRate = 0.10
+
+  -- Calculation: Operator calculates the royalty payment split
+  splitCid <- submit operator do
+    exerciseCmd engineCid CalculateRoyalty with
+      reportCid = usageReportCid
+      holderCids = [creatorHolderCid]
+
+  -- Verification: Check the resulting PaymentSplit contract
+  split <- fetch splitCid
+  let expectedTotalRoyalty = 100.0
+  let expectedPayee = Payee with holder = creator, amount = 100.0
+
+  split.contentId === contentId
+  split.totalRoyaltyAmount === expectedTotalRoyalty
+  split.payees === [expectedPayee]
+  debug "SUCCESS: test_SingleHolder"
+
+-- | Test scenario: Royalty split between multiple rights holders with varying shares.
+test_MultiHolder operator licensee creator producer publisher engineCid = script do
+  debug "Running test_MultiHolder..."
+  let contentId = "ALBUM-002"
+
+  -- Setup: Three parties hold rights with shares summing to 1.0
+  creatorHolderCid <- submit creator do
+    createCmd RightsHolder with operator, contentId, holder = creator, share = 0.50
+  producerHolderCid <- submit producer do
+    createCmd RightsHolder with operator, contentId, holder = producer, share = 0.30
+  publisherHolderCid <- submit publisher do
+    createCmd RightsHolder with operator, contentId, holder = publisher, share = 0.20
+
+  -- Action: Licensee reports usage
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with
+      operator, licensee, contentId, revenue = 50000.0, royaltyRate = 0.12
+
+  -- Calculation: Operator calculates the split
+  splitCid <- submit operator do
+    exerciseCmd engineCid CalculateRoyalty with
+      reportCid = usageReportCid
+      holderCids = [creatorHolderCid, producerHolderCid, publisherHolderCid]
+
+  -- Verification: Check the resulting PaymentSplit
+  split <- fetch splitCid
+  let expectedTotalRoyalty = 6000.0
+  let expectedPayees = [
+        Payee with holder = creator, amount = 3000.0,
+        Payee with holder = producer, amount = 1800.0,
+        Payee with holder = publisher, amount = 1200.0
+      ]
+
+  split.contentId === contentId
+  split.totalRoyaltyAmount === expectedTotalRoyalty
+  -- Sort lists by holder party to ensure comparison is order-independent
+  sortOn (.holder) split.payees === sortOn (.holder) expectedPayees
+
+  -- Verify that the sum of individual splits equals the total royalty
+  let sumOfSplits = sum $ map (.amount) split.payees
+  sumOfSplits === expectedTotalRoyalty
+  debug "SUCCESS: test_MultiHolder"
+
+-- | Test scenario: Licensee reports zero revenue, resulting in zero royalties.
+test_ZeroRevenue operator licensee creator engineCid = script do
+  debug "Running test_ZeroRevenue..."
+  let contentId = "PODCAST-003"
+
+  holderCid <- submit creator do
+    createCmd RightsHolder with operator, contentId, holder = creator, share = 1.0
+
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with
+      operator, licensee, contentId, revenue = 0.0, royaltyRate = 0.15
+
+  splitCid <- submit operator do
+    exerciseCmd engineCid CalculateRoyalty with reportCid = usageReportCid, holderCids = [holderCid]
+
+  split <- fetch splitCid
+  split.totalRoyaltyAmount === 0.0
+  split.payees === [Payee with holder = creator, amount = 0.0]
+  debug "SUCCESS: test_ZeroRevenue"
+
+-- | Test scenario: Distribution with fractional shares to test decimal precision and rounding.
+test_ComplexDistribution operator licensee creator producer publisher engineCid = script do
+  debug "Running test_ComplexDistribution..."
+  let contentId = "FILM-SCORE-004"
+
+  -- Setup: Shares that don't divide cleanly but sum to 1.0.
+  creatorHolderCid <- submit creator do
+    createCmd RightsHolder with operator, contentId, holder = creator, share = 0.3333333333
+  producerHolderCid <- submit producer do
+    createCmd RightsHolder with operator, contentId, holder = producer, share = 0.3333333333
+  publisherHolderCid <- submit publisher do
+    createCmd RightsHolder with operator, contentId, holder = publisher, share = 0.3333333334
+
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with operator, licensee, contentId, revenue = 100.0, royaltyRate = 0.10
+
+  splitCid <- submit operator do
+    exerciseCmd engineCid CalculateRoyalty with
+      reportCid = usageReportCid, holderCids = [creatorHolderCid, producerHolderCid, publisherHolderCid]
+
+  split <- fetch splitCid
+  let expectedTotalRoyalty = 10.0
+  split.totalRoyaltyAmount === expectedTotalRoyalty
+
+  -- Primary verification: The sum of individual payments must equal the total royalty amount.
+  -- This confirms that the implementation correctly handles any rounding "dust".
+  let sumOfSplits = sum $ map (.amount) split.payees
+  sumOfSplits === expectedTotalRoyalty
+  debug "SUCCESS: test_ComplexDistribution"
+
+-- | Test failure: Calculation should fail if no rights holders are provided.
+test_NoHoldersFailure operator licensee engineCid = script do
+  debug "Running test_NoHoldersFailure..."
+  let contentId = "BOOK-005"
+
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with operator, licensee, contentId, revenue = 1000.0, royaltyRate = 0.05
+
+  result <- submitMustFail operator do
+    exerciseCmd engineCid CalculateRoyalty with reportCid = usageReportCid, holderCids = []
+
+  -- Verify that the error message indicates the problem.
+  assert $ "Rights holders list cannot be empty" `isInfixOf` toText result
+  debug "SUCCESS: test_NoHoldersFailure"
+
+-- | Test failure: Calculation should fail if rights holder shares do not sum to 1.0.
+test_InvalidSharesFailure operator licensee creator producer engineCid = script do
+  debug "Running test_InvalidSharesFailure..."
+  let contentId = "GAME-006"
+
+  -- Setup: Shares sum to 1.2, which is an invalid state.
+  holder1Cid <- submit creator do
+    createCmd RightsHolder with operator, contentId, holder = creator, share = 0.6
+  holder2Cid <- submit producer do
+    createCmd RightsHolder with operator, contentId, holder = producer, share = 0.6
+
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with operator, licensee, contentId, revenue = 2000.0, royaltyRate = 0.20
+
+  result <- submitMustFail operator do
+    exerciseCmd engineCid CalculateRoyalty with
+      reportCid = usageReportCid, holderCids = [holder1Cid, holder2Cid]
+
+  assert $ "Rights holder shares must sum to 1.0" `isInfixOf` toText result
+  debug "SUCCESS: test_InvalidSharesFailure"
+
+-- | Test failure: Calculation should fail if the `contentId` does not match between inputs.
+test_MismatchedContentIdFailure operator licensee creator producer engineCid = script do
+  debug "Running test_MismatchedContentIdFailure..."
+
+  -- Setup: Create holder and report contracts for different content IDs.
+  let contentId1 = "SONG-A"
+  let contentId2 = "SONG-B"
+
+  holderCid <- submit creator do
+    createCmd RightsHolder with operator, contentId = contentId1, holder = creator, share = 1.0
+
+  usageReportCid <- submit licensee do
+    createCmd UsageReport with operator, licensee, contentId = contentId2, revenue = 100.0, royaltyRate = 0.10
+
+  result <- submitMustFail operator do
+    exerciseCmd engineCid CalculateRoyalty with
+      reportCid = usageReportCid, holderCids = [holderCid]
+
+  assert $ "Content ID mismatch" `isInfixOf` toText result
+  debug "SUCCESS: test_MismatchedContentIdFailure"

@@ -1,0 +1,108 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module PaymentSplit where
+
+import Daml.Script
+
+import DA.Action (forA)
+import DA.List (map, sum)
+import DA.Assert ((===))
+
+import UsageReport (UsageReport)
+
+-- | Represents a specific, payable amount owed to a single rights holder.
+-- This contract is the output of the distribution process and acts as an instruction
+-- for the payer (the operator) to settle the amount with the receiver (the rights holder).
+-- It provides a clear, auditable record of each individual payment obligation.
+template RoyaltyPaymentObligation
+  with
+    payer           : Party
+      -- ^ The party obligated to make the payment, typically the platform operator.
+    receiver        : Party
+      -- ^ The rights holder who is owed the royalty payment.
+    amount          : Decimal
+      -- ^ The exact amount of the royalty payment owed.
+    contentId       : Text
+      -- ^ The unique identifier for the content that generated the royalty.
+    usageReportCid  : ContractId UsageReport
+      -- ^ A reference to the original usage report for traceability.
+  where
+    signatory payer
+    observer receiver
+
+    key (payer, receiver, usageReportCid) : (Party, Party, ContractId UsageReport)
+    maintainer key._1
+
+    -- | Confirms that the payment has been made and settled.
+    -- This choice would be exercised after an off-ledger payment (e.g., bank transfer)
+    -- or an on-ledger token transfer has been completed.
+    choice Settle : ()
+      with
+        settlementReference : Text
+          -- ^ A reference for the settlement transaction, e.g., a bank transaction ID
+          -- or an on-chain transaction hash.
+      controller payer, receiver
+      do
+        -- This choice archives the obligation upon successful settlement.
+        -- In a production system, this could also trigger the creation of a
+        -- `SettlementReceipt` contract or emit a choice-as-event for external systems.
+        return ()
+
+    -- | Allows the receiver to unilaterally dismiss the obligation.
+    -- This can be used for cleanup if the payment was handled through other means
+    -- or if the obligation was created in error.
+    choice Dismiss : ()
+      controller receiver
+      do
+        return ()
+
+-- | Holds the calculated royalty amounts for a specific usage event, ready for distribution.
+-- It's created after a `RoyaltyCalculation` is approved and contains the exact amounts
+-- to be paid to each rights holder. This contract acts as the final checkpoint before
+-- individual payment obligations are dispatched.
+template PaymentSplit
+  with
+    operator        : Party
+      -- ^ The party running the royalty engine, responsible for distribution.
+    licensee        : Party
+      -- ^ The party who reported the usage and is the source of the royalty funds.
+    totalRoyalty    : Decimal
+      -- ^ The total royalty amount to be distributed from this usage event.
+    contentId       : Text
+      -- ^ The unique identifier for the content.
+    splits          : [(Party, Decimal)]
+      -- ^ A list of tuples, each containing a rights holder's party and the specific amount they are owed.
+    usageReportCid  : ContractId UsageReport
+      -- ^ A reference to the original usage report for full auditability.
+  where
+    signatory operator
+    observer licensee, rightsHolders
+      where
+        rightsHolders = map fst splits
+
+    ensure
+      let calculatedSum = sum (map snd splits)
+      in totalRoyalty === calculatedSum
+        -- The sum of all individual splits must exactly match the total royalty amount.
+
+    key (operator, contentId, usageReportCid) : (Party, Text, ContractId UsageReport)
+    maintainer key._1
+
+    -- | Triggers the creation of individual `RoyaltyPaymentObligation` contracts for each
+    -- rights holder. This is the final step in the royalty engine's automated process,
+    -- creating auditable, independent obligations for settlement.
+    choice DistributePayments : [ContractId RoyaltyPaymentObligation]
+      controller operator
+      do
+        -- Atomically create a `RoyaltyPaymentObligation` for each entry in the splits list.
+        -- If any creation fails, the entire transaction is rolled back, ensuring
+        -- that either all obligations are created or none are.
+        forA splits (\(holder, amount) ->
+          create RoyaltyPaymentObligation with
+            payer = operator
+            receiver = holder
+            amount = amount
+            contentId = contentId
+            usageReportCid = usageReportCid
+          )

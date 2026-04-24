@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  daml-ci:
+    name: Build and Test Daml Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache DPM
+        id: cache-dpm
+        uses: actions/cache@v4
+        with:
+          path: ~/.dpm
+          key: ${{ runner.os }}-dpm
+
+      - name: Install DPM
+        if: steps.cache-dpm.outputs.cache-hit != 'true'
+        run: curl https://get.digitalasset.com/install/install.sh | sh
+
+      - name: Add DPM to PATH
+        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+
+      - name: Display DPM version
+        run: dpm --version
+
+      - name: Build Daml project
+        run: dpm build
+
+      - name: Test Daml project
+        run: dpm test
+
+  frontend-ci:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check and lint
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build

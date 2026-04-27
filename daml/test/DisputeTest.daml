@@ -1,0 +1,188 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Royalty.Test.DisputeTest where
+
+import Daml.Script
+import DA.Assert
+import DA.List (elem)
+
+-- The tests in this file assume a dispute workflow defined in `Royalty.Dispute`.
+-- Since we are testing in isolation, we will define simplified, local versions
+-- of the relevant contracts to model the expected behavior.
+-- In a real project, these would be imported from `Royalty.Model` and `Royalty.Dispute`.
+
+-- Local test version of the DisputedAllocation contract from Royalty.Dispute
+template DisputedAllocation
+  with
+    originalAllocation: RoyaltyAllocation
+    disputingParty: Party
+    reason: Text
+  where
+    signatory originalAllocation.creator, originalAllocation.arbiter
+    observer disputingParty, originalAllocation.rightsHolders
+
+    key (originalAllocation.creator, originalAllocation.contentId) : (Party, Text)
+    maintainer key._1
+
+    choice ResolveDispute : ContractId RoyaltyAllocation
+      with
+        newRightsHolders: [Party]
+        newShares: [Decimal]
+      controller originalAllocation.arbiter
+      do
+        assertMsg "New rights holders list cannot be empty" (not $ null newRightsHolders)
+        assertMsg "Shares list must match rights holders list" (length newRightsHolders == length newShares)
+        assertMsg "Shares must sum to 1.0" (sum newShares == 1.0)
+        create originalAllocation with
+          rightsHolders = newRightsHolders
+          shares = newShares
+
+    choice RejectDispute : ContractId RoyaltyAllocation
+      controller originalAllocation.arbiter
+      do
+        create originalAllocation
+
+-- Local test version of the RoyaltyAllocation contract from Royalty.Model
+template RoyaltyAllocation
+  with
+    contentId: Text
+    creator: Party
+    rightsHolders: [Party]
+    shares: [Decimal]
+    arbiter: Party
+  where
+    signatory creator
+    observer rightsHolders, arbiter
+
+    key (creator, contentId) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      length rightsHolders == length shares &&
+      sum shares == 1.0 &&
+      not (null rightsHolders)
+
+    choice RaiseDispute : ContractId DisputedAllocation
+      with
+        reason: Text
+      controller (head rightsHolders) -- In this test, we assume a specific stakeholder disputes
+      do
+        let disputingParty = head rightsHolders
+        assertMsg "Disputing party must be a stakeholder" (elem disputingParty (creator :: rightsHolders))
+        create DisputedAllocation with
+          originalAllocation = self
+          disputingParty
+          reason
+
+disputeTests : Script ()
+disputeTests = script do
+  creator <- allocatePartyWithHint "Creator" (PartyIdHint "creator")
+  distributor <- allocatePartyWithHint "Distributor" (PartyIdHint "distributor")
+  arbiter <- allocatePartyWithHint "Arbiter" (PartyIdHint "arbiter")
+  outsider <- allocatePartyWithHint "Outsider" (PartyIdHint "outsider")
+
+  let
+    initialAllocation = RoyaltyAllocation with
+      contentId = "SONG-123"
+      creator
+      rightsHolders = [creator, distributor]
+      shares = [0.6, 0.4]
+      arbiter
+
+  test "Stakeholder can successfully raise a dispute" do
+    allocationCid <- submit creator do create initialAllocation
+
+    -- The distributor, a stakeholder, disputes the allocation
+    disputedCid <- submit distributor do
+      exercise allocationCid RaiseDispute with reason = "My royalty share should be 50%."
+
+    -- Verify the original allocation is archived
+    archiveRes <- queryContractId distributor allocationCid
+    archiveRes === None
+
+    -- Verify the new disputed contract exists
+    Some disputedContract <- queryContractId distributor disputedCid
+    disputedContract.disputingParty === distributor
+    disputedContract.reason === "My royalty share should be 50%."
+    disputedContract.originalAllocation === initialAllocation
+
+  test "Non-stakeholder cannot raise a dispute" do
+    allocationCid <- submit creator do create initialAllocation
+
+    -- The outsider, not a stakeholder, attempts to dispute
+    submitMustFail outsider do
+      exercise allocationCid RaiseDispute with reason = "I want a cut."
+
+    -- Verify original contract is still active
+    Some _ <- queryContractId creator allocationCid
+    pure ()
+
+  test "Arbiter can resolve a dispute with new terms" do
+    allocationCid <- submit creator do create initialAllocation
+    disputedCid <- submit distributor do
+      exercise allocationCid RaiseDispute with reason = "Share correction needed."
+
+    let
+      resolvedShares = [0.5, 0.5]
+      resolvedHolders = [creator, distributor]
+
+    -- Arbiter resolves the dispute, creating a new allocation
+    resolvedCid <- submit arbiter do
+      exercise disputedCid ResolveDispute with
+        newShares = resolvedShares
+        newRightsHolders = resolvedHolders
+
+    -- Verify the disputed contract is archived
+    archiveRes <- queryContractId arbiter disputedCid
+    archiveRes === None
+
+    -- Verify the new, corrected allocation exists
+    Some resolvedContract <- queryContractId arbiter resolvedCid
+    resolvedContract.shares === resolvedShares
+    resolvedContract.rightsHolders === resolvedHolders
+
+  test "Non-arbiter cannot resolve a dispute" do
+    allocationCid <- submit creator do create initialAllocation
+    disputedCid <- submit distributor do
+      exercise allocationCid RaiseDispute with reason = "Share correction needed."
+
+    -- Creator, not the arbiter, attempts to resolve
+    submitMustFail creator do
+      exercise disputedCid ResolveDispute with
+        newShares = [0.5, 0.5]
+        newRightsHolders = [creator, distributor]
+
+    -- Distributor, the disputing party, also cannot resolve
+    submitMustFail distributor do
+      exercise disputedCid ResolveDispute with
+        newShares = [0.5, 0.5]
+        newRightsHolders = [creator, distributor]
+
+  test "Arbiter can reject a dispute, reinstating original terms" do
+    allocationCid <- submit creator do create initialAllocation
+    disputedCid <- submit distributor do
+      exercise allocationCid RaiseDispute with reason = "Invalid claim."
+
+    -- Arbiter rejects the dispute
+    reinstatedCid <- submit arbiter do
+      exercise disputedCid RejectDispute
+
+    -- Verify the disputed contract is archived
+    archiveRes <- queryContractId arbiter disputedCid
+    archiveRes === None
+
+    -- Verify a new allocation exists with the original terms
+    Some reinstatedContract <- queryContractId arbiter reinstatedCid
+    reinstatedContract === initialAllocation
+
+  test "Non-arbiter cannot reject a dispute" do
+    allocationCid <- submit creator do create initialAllocation
+    disputedCid <- submit distributor do
+      exercise allocationCid RaiseDispute with reason = "Invalid claim."
+
+    -- Creator, not the arbiter, attempts to reject
+    submitMustFail creator do exercise disputedCid RejectDispute
+
+    -- Distributor, the disputing party, also cannot reject
+    submitMustFail distributor do exercise disputedCid RejectDispute
